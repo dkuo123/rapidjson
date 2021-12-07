@@ -1,0 +1,238 @@
+https://github.com/Tencent/rapidjson/issues/1333
+
+in my code, memory goes crazy due to large number of REST request parsing account balance( each Coinbase FILL triggers it, in addition to regular timer one(once every 3 seconds)).
+our app runs 24x7.
+
+#pragma once
+
+#include <string_view>
+
+#include <rapidjson/document.h>
+#include <utils/utils.h>
+#include <messages/error_message.h>
+
+#include "../interface/api.h"
+#include "../utils/rest_connection_handler.h"
+#include "../utils/base_exception.h"
+
+#include "models/orderbook_request.h"
+#include "models/orderbook_response.h"
+#include "models/error_response.h"
+#include "models/exchange_info.h"
+#include "models/asset_balance_request.h"
+#include "models/asset_balance_response.h"
+#include "models/query_order_list_request.h"
+#include "models/query_order_list_response.h"
+#include "types.h"
+
+namespace crypto::exchanges::coinbase {
+
+class RestApiException : public crypto::exchanges::BaseException {
+public:
+    explicit RestApiException(const crypto::exchanges::connection::RestConnection::response_t &msg);
+};
+
+using async_error_reply_callback_t = std::function<void (
+    crypto::messages::error_message_t)>;
+
+using async_asset_balance_response_callback_t = std::function<void (
+    models::asset_balance_response_t&)>;
+
+using async_order_list_response_callback_t = std::function<void (
+    models::query_open_orders_response_t&)>;
+
+class RestApi {
+private:
+    rapidjson::Document document;
+    //rapidjson::GenericDocument<rapidjson::UTF8<>, rapidjson::CrtAllocator>  document;
+    rapidjson::StringBuffer buffer;
+
+    std::string url;
+    std::string params_;
+
+    const std::string api_key;
+    const std::string secret_key;
+    const std::string passphrase;
+    const std::string base_url_ = "https://api.exchange.coinbase.com";
+
+    connection::RestConnectionHandler connection;
+
+    void refresh_timestamp();
+    curl_slist* construct_httpsheader(
+        std::string_view endpoint, std::string_view params,
+        std::string& post_data, std::string_view method,
+        bool authorization);
+
+    models::orderbook_response_t orderbook_response_;
+    models::exchange_info_t exchange_info_;
+    models::asset_balance_response_t asset_balance_response_;
+    models::query_open_orders_response_t query_order_list_response_;
+
+    template<typename T>
+    void append_params(T &request, std::string &url);
+
+    template<typename T, typename S>
+    inline T parse(S &s) {
+        this->document.Parse<rapidjson::kParseDefaultFlags>(s.data(), s.size());
+        json_dto::check_document_parse_status(this->document);
+        return json_dto::from_json<T>(this->document);
+    }
+
+    template<typename T, typename S>
+    inline void parse(S &s, T &t) {
+        t.reset();
+
+        this->document.Parse<rapidjson::kParseDefaultFlags>(s.data(), s.size());
+        json_dto::check_document_parse_status(this->document);
+        json_dto::from_json<T>(this->document, t);
+        rapidjson::Document d;   // =========> this Document Swap eliminate memory leak.
+        this->document.Swap(d);
+    }
+
+    template<typename REQUEST, typename RESPONSE>
+    const RESPONSE& send_request(
+        REQUEST& request, RESPONSE& resp_buffer, std::string_view ep,
+        std::string_view method = "GET",
+        bool authorization = false);
+
+    template<typename REQUEST, typename RESPONSE>
+    void async_send_request(
+        REQUEST& request, RESPONSE& resp_buffer, std::string_view ep,
+        uint64_t request_id,
+        std::function<void (RESPONSE&)> reply_callback,
+        async_error_reply_callback_t error_callback,
+        std::string_view method = "GET",
+        bool authorization = false);
+
+public:
+    RestApi(std::string api_key, std::string secret_key, 
+            std::string passphrase, bool for_fh);
+
+    RestApi(
+        crypto::exchanges::async_engine_ptr_t& async_engine_ptr, 
+        std::string api_key, std::string secret_key, 
+        std::string passphrase, std::string interface_ip,
+        bool for_fh);
+
+    models::orderbook_response_t orderbook(
+        const models::orderbook_request_t &);
+
+    const models::exchange_info_t& exchange_info(); // GET /products
+
+    models::asset_balance_response_t get_asset_balance();
+    void async_asset_balance_request(
+        uint64_t request_id,
+        const models::asset_balance_request_t& request, 
+        async_asset_balance_response_callback_t reply_callback,
+        async_error_reply_callback_t error_callback);
+
+    models::query_open_orders_response_t query_open_orders(
+        const models::query_order_list_request_t &request);
+    void async_query_open_orders(
+        uint64_t request_id,
+        const models::query_order_list_request_t& request,
+        async_order_list_response_callback_t reply_callback,
+        async_error_reply_callback_t error_callback);
+
+    void check_connections(tp_t& now);
+};
+
+template<typename REQUEST, typename RESPONSE>
+const RESPONSE& RestApi::send_request(
+        REQUEST& request, RESPONSE& resp_buffer, std::string_view ep,
+        std::string_view method, bool authorization) {
+    this->url = this->base_url_;
+    this->url += ep;
+    this->params_.clear();
+    this->append_params(request, this->params_);
+    this->url.append(this->params_);
+    std::string encoded_data;
+    auto extra_http_header = construct_httpsheader(
+        ep, this->params_, encoded_data, method, authorization);
+    resp_buffer.reset();
+
+    auto response = this->connection.request(
+        this->url, extra_http_header, encoded_data, method, -1, true);
+
+    if (response.first != 200 && response.first != 201) {
+        throw RestApiException(response);
+    }
+
+    try {
+        this->parse<RESPONSE>(response.second, resp_buffer);
+        return resp_buffer;
+    }
+    catch (const std::exception &e) {
+#ifndef NDEBUG
+         spdlog::info("<RestApi::send_request>, exception={}", 
+             e.what());
+#endif
+        throw RestApiException(response);
+    }
+}
+
+template<typename REQUEST, typename RESPONSE>
+void RestApi::async_send_request(
+        REQUEST& request, RESPONSE& resp_buffer, 
+        std::string_view ep, uint64_t request_id,
+        std::function<void (RESPONSE&)> reply_callback,
+        async_error_reply_callback_t error_callback,
+        std::string_view method, bool authorization) {
+    /*
+    if constexpr (std::is_same_v<models::new_order_request_t, 
+            typename std::decay_t<REQUEST>>) {
+        check_order_rate_ctrls(request_id);
+    } else {
+        check_other_rate_ctrls(request_id);
+    }
+    */
+    this->url = this->base_url_;
+    this->url += ep;
+    this->params_.clear();
+    this->append_params(request, this->params_);
+    this->url.append(this->params_);
+    std::string encoded_data;
+    auto extra_http_header = construct_httpsheader(
+        ep, this->params_, encoded_data, method, authorization);
+    resp_buffer.reset();
+
+    auto cb = [&, request, reply_callback = std::move(reply_callback),
+        error_callback = std::move(error_callback)](
+            async_connection::response_t response) {
+        try {
+            this->parse<RESPONSE>(response.second, resp_buffer);
+            reply_callback(resp_buffer);
+        }
+        catch (const std::exception &e) {
+#ifndef NDEBUG
+            spdlog::error(
+                "<RestApi::async_send_request>, exception={},code={},response={}", 
+                e.what(), response.first, response.second);
+#endif
+            RestApiException exc(response);
+            error_callback(exc.what());
+        }
+    };
+
+    if (!this->connection.async_request(
+        // GET doesn't need adding encoded_data to url, will add when we do POST later
+        this->url, extra_http_header, "", method, std::move(cb), -1, true)) {
+        std::string error_msg = "Failed to add async send request,";
+        error_msg += "request_id=";
+        error_msg += std::to_string(request_id);
+        throw crypto::exchanges::BaseException(
+            crypto::messages::error_message_t(
+                crypto::messages::ErrorType::TOO_MANY_REQUESTS,
+                error_msg.c_str()));
+    }
+    /*
+    if constexpr (std::is_same_v<models::new_order_request_t, 
+            typename std::decay_t<REQUEST>>) {
+        set_order_rate_ctrls();
+    } else {
+        set_other_rate_ctrls();
+    }
+    */
+}
+
+}  // namespace crypto::exchanges::coinbase
